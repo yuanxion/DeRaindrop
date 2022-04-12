@@ -1,9 +1,13 @@
 import argparse
 import glob
+import math
 import os
 import torch
 import matplotlib.pyplot as plt
+from PIL import Image
 from torch.utils.data import Dataset, DataLoader, RandomSampler, random_split
+from torchvision import transforms
+from torchvision.utils import make_grid
 
 # parser
 def get_parser_config():
@@ -43,14 +47,14 @@ class MyComplexDataset(Dataset):
         self.defoggy_gt_folder = 'data/defoggy/gt/'
         self.transformer = transformer
 
-        self.defoggy_raw_path = glob.glob(self.defoggy_raw_folder + '*jpg')
-        self.defoggy_gt_path = glob.glob(self.defoggy_gt_folder + '*jpg')
-        print('self.defoggy_raw_path:', len(self.defoggy_raw_path))
-        print('self.defoggy_gt_path:', len(self.defoggy_gt_path))
+        self.defoggy_raw_files = glob.glob(self.defoggy_raw_folder + '*jpg')
+        self.defoggy_gt_files = glob.glob(self.defoggy_gt_folder + '*jpg')
+        print('self.defoggy_raw_files:', len(self.defoggy_raw_files))
+        print('self.defoggy_gt_files:', len(self.defoggy_gt_files))
 
         images_map = {}
         # map raw to gt
-        for image_path in self.defoggy_raw_path:
+        for image_path in self.defoggy_raw_files:
             raw_name = image_path.split('/')[-1]
             splits = raw_name.split('_')
             gt_name = splits[0] + '_' + splits[1] + '.jpg'
@@ -74,7 +78,15 @@ class MyComplexDataset(Dataset):
                 )
 
     def __getitem__(self, index):
-        return self.image_pairs[index]
+        defoggy_raw_file, defoggy_gt_file = self.image_pairs[index]
+        defoggy_raw_img = Image.open(defoggy_raw_file)
+        defoggy_gt_img = Image.open(defoggy_gt_file)
+
+        if self.transformer:
+            defoggy_raw_img = self.transformer(defoggy_raw_img)
+            defoggy_gt_img = self.transformer(defoggy_gt_img)
+
+        return defoggy_raw_img, defoggy_gt_img
 
     def __len__(self):
         return len(self.image_pairs)
@@ -83,12 +95,20 @@ class MyComplexDataset(Dataset):
 if __name__ == '__main__':
     print('[+] Train')
 
+    # parser config
     config = get_parser_config()
 
-    dataset = MyComplexDataset(is_train=True)
+    # dataset
+    my_transformer = transforms.Compose([
+        #transforms.Resize((224,224)),
+        transforms.ToTensor(),
+    ])
+
+    dataset = MyComplexDataset(is_train=True, transformer=my_transformer)
     total_size = len(dataset)
     print('total_size:', total_size)
 
+    # train test split
     split_rate = 0.8
     train_size = int(split_rate * total_size)
     val_size = total_size - train_size
@@ -99,9 +119,33 @@ if __name__ == '__main__':
     print('train_ds size:', len(train_ds))
     print('val_ds size:', len(val_ds))
 
+    # dataloader
     train_loader = DataLoader(
         train_ds, batch_size=config.batch_size, shuffle=True, drop_last=True
     )
 
-    for i, [raw_bs, gt_bs] in enumerate(train_loader):
-        print('batch_{}: {}, {}'.format(i, raw_bs, gt_bs))
+    # plot
+    figure, (ax_raw,ax_gt) = plt.subplots(1,2, figsize=(10,8))
+    plt.ion()
+
+    # train
+    for i, (raw_bs, gt_bs) in enumerate(train_loader):
+        #print('batch_{}: {}, {}'.format(i, raw_bs.shape, gt_bs.shape))
+
+        # display batch images
+        grid_columns = int(math.sqrt(config.batch_size))
+        #print('grid_columns:', grid_columns)
+
+        grid_raw = make_grid(raw_bs, nrow=grid_columns, padding=0)
+        grid_gt = make_grid(gt_bs, nrow=grid_columns, padding=0)
+        #print('grid_raw.shape:', grid_raw.shape)
+        #print('grid_gt.shape:', grid_gt.shape)
+
+        ax_raw.imshow(grid_raw.permute(1,2,0))
+        ax_gt.imshow(grid_gt.permute(1,2,0))
+
+        plt.show()
+        plt.pause(0.2)
+
+    plt.pause()
+    plt.ioff()
