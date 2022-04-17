@@ -8,6 +8,7 @@ import gc
 
 from GPUtil import showUtilization as gpu_usage
 import torch
+from torch import nn
 from torch.nn import BCELoss, MSELoss
 from torch.optim import Adam
 from models.discriminator import Discriminator
@@ -16,7 +17,7 @@ from PIL import Image
 from torch.utils.data import Dataset, DataLoader, RandomSampler, random_split
 from torchvision import transforms
 from torchvision.utils import make_grid
-
+from torchvision.models.vgg import vgg16
 
 # parser
 def get_parser_config():
@@ -24,11 +25,46 @@ def get_parser_config():
 
     parser.add_argument('--type', type=str, default='test')
     parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--dataset', type=str, default='derain')
     parser.add_argument('--num_workers', type=int, default=1)
 
     config = parser.parse_args()
     print('get_parser_config config:', config)
     return config
+
+
+def get_masks_diff(raw_bs, gt_bs):
+    mask = torch.abs(raw_bs - gt_bs)
+    std, mean = torch.std_mean(mask)
+    print('get_masks_diff mean:{}, std:{}'.format(mean, std))
+
+    # threshold under 30
+    mask[mask < (30.0 / 255.0)] = 0.0
+    mask[mask > 0.0] = 1.0
+    # print('get_masks mask:', mask.shape)
+
+    # avg? max?
+    # mask = np.average(mask, axis=2)
+    mask = torch.max(mask, axis=1).values
+    # print('get_masks np.max mask.shape', mask.shape)
+    mask = torch.unsqueeze(mask, axis=1)
+    # print('get_masks expand_dims mask.shape', mask.shape)
+
+    return mask
+
+
+def get_atten_loss(masks_gen, masks_diff):
+    loss_atten = None
+    for i in range(1, 5):
+        if i == 1:
+            loss_atten = pow(0.8, float(4 - i)) * mse_loss(
+                masks_gen[i - 1], masks_diff
+            )
+        else:
+            loss_atten += pow(0.8, float(4 - i)) * mse_loss(
+                masks_gen[i - 1], masks_diff
+            )
+    return loss_atten
 
 
 # data folder
@@ -49,62 +85,147 @@ def get_parser_config():
 #
 class MyComplexDataset(Dataset):
     def __init__(
-        self, is_test=False, is_val=False, is_train=True, transformer=None
+        self,
+        dataset='defoggy',
+        is_test=False,
+        is_val=False,
+        is_train=True,
+        transformer=None,
     ):
 
-        self.defoggy_raw_folder = 'data/defoggy/data/'
-        self.defoggy_gt_folder = 'data/defoggy/gt/'
         self.transformer = transformer
+        self.image_pairs = []
 
-        self.defoggy_raw_files = glob.glob(self.defoggy_raw_folder + '*jpg')
-        self.defoggy_gt_files = glob.glob(self.defoggy_gt_folder + '*jpg')
-        # print('self.defoggy_raw_files:', len(self.defoggy_raw_files))
-        # print('self.defoggy_gt_files:', len(self.defoggy_gt_files))
+        if dataset == 'derain':
+            # 9_rain.png, 9_clean.png
 
-        images_map = {}
+            if is_train:
+                self.derain_raw_folder = 'data/derain/train/data/'
+                self.derain_gt_folder = 'data/derain/train/gt/'
+            elif is_val:
+                self.derain_raw_folder = 'data/derain/val/data/'
+                self.derain_gt_folder = 'data/derain/val/gt/'
+            elif is_test:
+                self.derain_raw_folder = 'data/derain/test/data/'
+                self.derain_gt_folder = 'data/derain/test/gt/'
+
+            self.derain_raw_files = glob.glob(self.derain_raw_folder + '*png')
+            self.derain_gt_files = glob.glob(self.derain_gt_folder + '*png')
+
+            self.raw_files = self.derain_raw_files
+
+        elif dataset == 'defoggy':
+            # defoggy: NYU2_1085.jpg: [NYU2_1085_1_2.jpg, NYU2_1085_1_3.jpg]
+
+            self.defoggy_raw_folder = 'data/defoggy/data/'
+            self.defoggy_gt_folder = 'data/defoggy/gt/'
+            self.defoggy_raw_files = glob.glob(
+                self.defoggy_raw_folder + '*jpg'
+            )
+            self.defoggy_gt_files = glob.glob(self.defoggy_gt_folder + '*jpg')
+            # print('self.defoggy_raw_files:', len(self.defoggy_raw_files))
+            # print('self.defoggy_gt_files:', len(self.defoggy_gt_files))
+
+            self.raw_files = self.defoggy_raw_files
+        else:
+            self.raw_files = None
+            print('unknown dataset')
+
         # map raw to gt
-        for image_path in self.defoggy_raw_files:
+        images_map = {}
+        for image_path in self.raw_files:
             raw_name = image_path.split('/')[-1]
             splits = raw_name.split('_')
-            gt_name = splits[0] + '_' + splits[1] + '.jpg'
+            if dataset == 'derain':
+                gt_name = splits[0] + '_clean.png'
+            elif dataset == 'defoggy':
+                gt_name = splits[0] + '_' + splits[1] + '.jpg'
 
-            # NYU2_1085.jpg: [NYU2_1085_1_2.jpg, NYU2_1085_1_3.jpg]
             if gt_name not in images_map:
                 images_map[gt_name] = []
             images_map[gt_name].append(raw_name)
             # print('pair {}:{}'.format(gt_name, raw_name))
             # print('pair {}:{}'.format(gt_name, images_map[gt_name]))
 
-        self.image_pairs = []
         # pair raw & gt images
-        for key in images_map:
-            for value in images_map[key]:
+        if dataset == 'derain':
+            for key, value in images_map.items():
+                # print('pair key:{}, value:{}'.format(key, value[0]))
                 self.image_pairs.append(
                     [
-                        self.defoggy_raw_folder + value,
-                        self.defoggy_gt_folder + key,
+                        self.derain_raw_folder + value[0],
+                        self.derain_gt_folder + key,
                     ]
                 )
+        elif dataset == 'defoggy':
+            for key in images_map:
+                for value in images_map[key]:
+                    self.image_pairs.append(
+                        [
+                            self.defoggy_raw_folder + value,
+                            self.defoggy_gt_folder + key,
+                        ]
+                    )
 
     def __getitem__(self, index):
-        defoggy_raw_file, defoggy_gt_file = self.image_pairs[index]
-        defoggy_raw_img = Image.open(defoggy_raw_file)
-        defoggy_gt_img = Image.open(defoggy_gt_file)
+        raw_file, gt_file = self.image_pairs[index]
+        raw_img = Image.open(raw_file)
+        gt_img = Image.open(gt_file)
 
         if self.transformer:
-            defoggy_raw_img = self.transformer(defoggy_raw_img)
-            # defoggy_raw_img = defoggy_raw_img.cuda()
-            defoggy_gt_img = self.transformer(defoggy_gt_img)
-            # defoggy_gt_img = defoggy_gt_img.cuda()
+            raw_img = self.transformer(raw_img)
+            gt_img = self.transformer(gt_img)
 
-        return defoggy_raw_img, defoggy_gt_img
+        return raw_img, gt_img
 
     def __len__(self):
         return len(self.image_pairs)
 
 
+class PerceptualLoss(nn.Module):
+    def __init__(self):
+        super(PerceptualLoss, self).__init__()
+        self.model = vgg16(pretrained=True).cuda()
+        # print('PerceptualLoss model:', self.model)
+
+        trainable = False
+        for para in self.model.parameters():
+            para.requires_grad = trainable
+
+        self.loss = MSELoss().cuda()
+        self.vgg_layers = self.model.features
+        self.layer_name_mapping = {
+            '1': "relu1_1",
+            '3': "relu1_2",
+            '6': "relu2_1",
+            '8': "relu2_2",
+        }
+
+    def get_layer_output(self, x):
+        output = []
+        for name, module in self.vgg_layers._modules.items():
+            # print('get_layer_output name:{}, module:{}'.format(name, module))
+            x = module(x)
+            if name in self.layer_name_mapping:
+                output.append(x)
+        return output
+
+    def __call__(self, raw_bs, gt_bs):
+        raw_bs = self.get_layer_output(raw_bs)
+        gt_bs = self.get_layer_output(gt_bs)
+        loss_PL = None
+        for i in range(len(gt_bs)):
+            if i == 0:
+                loss_PL = self.loss(raw_bs[i], gt_bs[i]) / float(len(gt_bs))
+            else:
+                loss_PL += self.loss(raw_bs[i], gt_bs[i]) / float(len(gt_bs))
+        return loss_PL
+
+
 def forward(raw_bs, gt_bs):
     # use GPU
+    gc.collect()
+    torch.cuda.empty_cache()
     raw_bs = raw_bs.cuda()
     gt_bs = gt_bs.cuda()
     # gpu_usage()
@@ -141,7 +262,11 @@ def forward(raw_bs, gt_bs):
     # train G
     mask_raw, pred_raw = D(gen_bs)
     loss_g_raw = bce_loss(pred_raw, label_raw)
-    loss_g = loss_g_raw
+    masks_diff = get_masks_diff(raw_bs, gt_bs)
+    loss_g_att = get_atten_loss(mask_list, masks_diff)
+    loss_g_per = per_loss(gen_bs, gt_bs)
+    # loss_g = loss_g_raw
+    loss_g = 0.01 * loss_g_raw + loss_g_per
     # print('loss_g_raw: {:.2f}'.format(loss_g_raw.item()))
 
     optim_g.zero_grad()
@@ -155,11 +280,9 @@ def forward(raw_bs, gt_bs):
     # plt.pause(0.02)
 
     # del grid_columns,grid_raw,grid_gt, mask_list,frame1,frame2,gen_bs, mask_raw,mask_gt, loss_d_raw,loss_d_gt
-    gc.collect()
-    torch.cuda.empty_cache()
     # gpu_usage()
 
-    return mean_pred_raw, mean_pred_gt
+    return mean_pred_raw, mean_pred_gt, loss_d, loss_g
 
 
 print('[+] Train')
@@ -174,21 +297,32 @@ my_transformer = transforms.Compose(
     ]
 )
 
-dataset = MyComplexDataset(is_train=True, transformer=my_transformer)
-total_size = len(dataset)
-print('total_size:', total_size)
-
-# train test split
 epoches = 100
-split_rate = 0.8
+split_rate_defoggy = 0.8
 grid_columns = int(math.sqrt(config.batch_size))
 
-train_size = int(split_rate * total_size)
-val_size = total_size - train_size
-# print('train_size:', train_size)
-# print('val_size:', val_size)
+if config.dataset == 'derain':
+    train_ds = MyComplexDataset(
+        dataset='derain', is_train=True, transformer=my_transformer
+    )
+    val_ds = MyComplexDataset(
+        dataset='derain',
+        is_val=True,
+        is_train=False,
+        transformer=my_transformer,
+    )
+elif config.dataset == 'defoggy':
+    # train test split
 
-train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    dataset = MyComplexDataset(
+        dataset='defoggy', is_train=True, transformer=my_transformer
+    )
+    train_size = int(split_rate_defoggy * total_size)
+    val_size = total_size - train_size
+    # print('train_size:', train_size)
+    # print('val_size:', val_size)
+    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+
 print('train_ds size:', len(train_ds))
 print('val_ds size:', len(val_ds))
 
@@ -216,6 +350,7 @@ label_gt = torch.ones_like(label_raw).cuda()
 # loss & history
 bce_loss = torch.nn.BCELoss()
 mse_loss = torch.nn.MSELoss()
+per_loss = PerceptualLoss()
 
 pred_history_raw = []
 pred_history_gt = []
@@ -233,11 +368,9 @@ for epoch in range(epoches):
     for i, (raw_bs, gt_bs) in enumerate(train_loader):
         plt.cla()
         torch.cuda.memory_summary(device="cuda", abbreviated=False)
-
         # print('batch_{}: {}, {}'.format(i, raw_bs.shape, gt_bs.shape))
 
         # display batch images
-
         grid_raw = make_grid(raw_bs, nrow=grid_columns, padding=5)
         grid_gt = make_grid(gt_bs, nrow=grid_columns, padding=5)
         # print('grid_raw.shape:', grid_raw.shape)
@@ -246,12 +379,13 @@ for epoch in range(epoches):
         ax_raw.imshow(grid_raw.cpu().detach().permute(1, 2, 0))
         ax_gt.imshow(grid_gt.cpu().detach().permute(1, 2, 0))
 
-        mean_pred_raw, mean_pred_gt = forward(raw_bs, gt_bs)
+        mean_pred_raw, mean_pred_gt, loss_d, loss_g = forward(raw_bs, gt_bs)
 
+        # plot prediction history
         pred_history_raw.append(mean_pred_raw.item())
         pred_history_gt.append(mean_pred_gt.item())
-        ax_pred.plot(pred_history_raw, label='raw')
-        ax_pred.plot(pred_history_gt, label='gt')
+        ax_pred.plot(pred_history_raw, label='pred_raw', linestyle='-.')
+        ax_pred.plot(pred_history_gt, label='pred_gt', linestyle='-.')
         ax_pred.text(
             len(pred_history_raw),
             mean_pred_raw,
@@ -260,6 +394,14 @@ for epoch in range(epoches):
         ax_pred.text(
             len(pred_history_gt), mean_pred_gt, '{:.2f}'.format(mean_pred_gt)
         )
+
+        # plot loss history
+        loss_history_d.append(torch.clamp(loss_d, 0, 2).item())
+        loss_history_g.append(torch.clamp(loss_g, 0, 2).item())
+        ax_pred.plot(loss_history_d, label='loss_d')
+        ax_pred.plot(loss_history_g, label='loss_g')
+        ax_pred.text(len(loss_history_d), loss_d, '{:.2f}'.format(loss_d))
+        ax_pred.text(len(loss_history_g), loss_g, '{:.2f}'.format(loss_g))
 
         plt.legend()
         plt.show()
