@@ -19,13 +19,16 @@ from torchvision import transforms
 from torchvision.utils import make_grid
 from torchvision.models.vgg import vgg16
 
+# import torch.autograd as autograd
+from torch.autograd import Variable
+
 # parser
 def get_parser_config():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--type', type=str, default='test')
     parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--dataset', type=str, default='derain')
+    parser.add_argument('--dataset', type=str, default='defoggy')
     parser.add_argument('--num_workers', type=int, default=1)
 
     config = parser.parse_args()
@@ -65,6 +68,52 @@ def get_atten_loss(masks_gen, masks_diff):
                 masks_gen[i - 1], masks_diff
             )
     return loss_atten
+
+
+def get_ms_loss(img_gens, gts):
+
+    T_ = []
+    ld = [0.6, 0.8, 1.0]
+    width = img_gens[2].size(2)
+    # print('base width', width)
+    width_4 = int(width / 4)
+    width_2 = int(width / 2)
+    transformer1 = transforms.Compose([transforms.Resize((width_4, width_4))])
+    transformer2 = transforms.Compose([transforms.Resize((width_2, width_2))])
+
+    for i in range(config.batch_size):
+        temp = []
+        pyramid = transformer1(gts[i])
+        temp.append(torch.unsqueeze(pyramid, axis=0))
+        pyramid = transformer2(gts[i])
+        temp.append(torch.unsqueeze(pyramid, axis=0))
+        temp.append(torch.unsqueeze(gts[i], axis=0))
+        T_.append(temp)
+    temp_T = []
+    for i in range(len(ld)):
+        for j in range(config.batch_size):
+            if j == 0:
+                x = T_[j][i]
+            else:
+                x = torch.cat((x, T_[j][i]), axis=0)
+        temp_T.append(x)
+    T_ = temp_T
+    loss_ML = None
+    for i in range(len(ld)):
+        # print('{}:{} img_gens:{} gts:{}'.format(i,len(ld), img_gens[i].shape, T_[i].shape))
+        if i == 0:
+            loss_ML = ld[i] * mse_loss(img_gens[i], T_[i])
+        else:
+            loss_ML += ld[i] * mse_loss(img_gens[i], T_[i])
+
+    return loss_ML / float(config.batch_size)
+
+
+def get_map_loss(mask_d_gen, mask_d_gt, mask_g_gen):
+    z = Variable(torch.zeros(mask_d_gt.shape)).cuda()
+    loss_gen = mse_loss(mask_d_gen, mask_g_gen)
+    loss_gt = mse_loss(mask_d_gt, z)
+    return 0.05 * (loss_gen + loss_gt)
 
 
 # data folder
@@ -236,7 +285,7 @@ def forward(raw_bs, gt_bs):
     print('gen_bs std_mean: {}'.format(torch.std_mean(gen_bs)))
     # print('gen_bs: {}'.format(gen_bs))
 
-    mask_raw, pred_raw = D(gen_bs.detach())
+    mask_gen, pred_raw = D(gen_bs.detach())
     mask_gt, pred_gt = D(gt_bs)
     mean_pred_raw = torch.mean(pred_raw)
     mean_pred_gt = torch.mean(pred_gt)
@@ -248,7 +297,8 @@ def forward(raw_bs, gt_bs):
 
     loss_d_raw = bce_loss(pred_raw, label_raw)
     loss_d_gt = bce_loss(pred_gt, label_gt)
-    loss_d = loss_d_raw + loss_d_gt
+    loss_d_map = get_map_loss(mask_gen, mask_gt, mask_list[-1].detach())
+    loss_d = loss_d_raw + loss_d_gt + loss_d_map
     # print(
     #    'loss_d_raw: {:.2f}, loss_d_gt: {:.2f}'.format(
     #        loss_d_raw.item(), loss_d_gt.item()
@@ -260,13 +310,14 @@ def forward(raw_bs, gt_bs):
     optim_d.step()
 
     # train G
-    mask_raw, pred_raw = D(gen_bs)
+    mask_gen, pred_raw = D(gen_bs)
     loss_g_raw = bce_loss(pred_raw, label_raw)
     masks_diff = get_masks_diff(raw_bs, gt_bs)
     loss_g_att = get_atten_loss(mask_list, masks_diff)
+    loss_g_ms = get_ms_loss([frame1, frame2, gen_bs], gt_bs)
     loss_g_per = per_loss(gen_bs, gt_bs)
     # loss_g = loss_g_raw
-    loss_g = 0.01 * loss_g_raw + loss_g_per
+    loss_g = 0.01 * loss_g_raw + loss_g_ms + loss_g_per
     # print('loss_g_raw: {:.2f}'.format(loss_g_raw.item()))
 
     optim_g.zero_grad()
@@ -279,7 +330,7 @@ def forward(raw_bs, gt_bs):
     # plt.show()
     # plt.pause(0.02)
 
-    # del grid_columns,grid_raw,grid_gt, mask_list,frame1,frame2,gen_bs, mask_raw,mask_gt, loss_d_raw,loss_d_gt
+    # del grid_columns,grid_raw,grid_gt, mask_list,frame1,frame2,gen_bs, mask_gen,mask_gt, loss_d_raw,loss_d_gt
     # gpu_usage()
 
     return mean_pred_raw, mean_pred_gt, loss_d, loss_g
@@ -312,11 +363,12 @@ if config.dataset == 'derain':
         transformer=my_transformer,
     )
 elif config.dataset == 'defoggy':
-    # train test split
-
     dataset = MyComplexDataset(
         dataset='defoggy', is_train=True, transformer=my_transformer
     )
+
+    # train test split
+    total_size = len(dataset)
     train_size = int(split_rate_defoggy * total_size)
     val_size = total_size - train_size
     # print('train_size:', train_size)
